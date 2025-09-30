@@ -1,0 +1,129 @@
+import os
+import time
+import argparse
+from datetime import datetime, timedelta
+from functools import wraps
+
+# Retry decorator for transient errors
+def retry_on_exception(max_retries=3, delay=5, exceptions=(Exception,)):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    print(f"Attempt {attempt + 1} failed: {e}")
+                    time.sleep(delay)
+            raise Exception(f"All {max_retries} attempts failed for {func.__name__}")
+        return wrapper
+    return decorator
+
+# Function to sanitize filenames for Windows
+def sanitize_filename(filename):
+    invalid_chars = '<>:\"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    return filename
+
+# Function to read configuration file
+def read_config(config_file):
+    config = {}
+    try:
+        with open(config_file, 'r') as f:
+            for line in f:
+                if '=' in line:
+                    key, value = line.strip().split('=', 1)
+                    decoded_value = value.strip().strip('"').encode('utf-8').decode('unicode_escape')
+                    if key.strip() == 'nafs_path' and not decoded_value.startswith('\\\\'):
+                        decoded_value = '\\\\' + decoded_value.lstrip('\\')
+                    config[key.strip()] = decoded_value
+    except Exception as e:
+        print(f"Error reading config file: {e}")
+    return config
+
+# Function to connect to SFTP server
+@retry_on_exception()
+def sftp_connect(hostname, port, username, password):
+    import paramiko
+    transport = paramiko.Transport((hostname, int(port)))
+    transport.connect(username=username, password=password)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    return sftp, transport
+
+# Function to sync files modified in the last interval
+def sync_files(sftp, remote_dir, local_base_dir, last_run_time, current_run_time):
+    try:
+        remote_files = sftp.listdir_attr(remote_dir)
+    except IOError as e:
+        print(f"Remote directory {remote_dir} not found: {e}")
+        return
+
+    for file_attr in remote_files:
+        file_name = file_attr.filename
+        file_mtime = datetime.fromtimestamp(file_attr.st_mtime)
+
+        # Check if file was modified between last run and current run
+        if last_run_time <= file_mtime <= current_run_time:
+            sanitized_name = sanitize_filename(file_name)
+            file_date_folder = file_mtime.strftime('%Y-%m-%d')
+            local_dir = os.path.join(local_base_dir, file_date_folder)
+            os.makedirs(local_dir, exist_ok=True)
+
+            remote_file_path = os.path.join(remote_dir, file_name).replace('\\', '/')
+            local_file_path = os.path.join(local_dir, sanitized_name)
+
+            should_download = True
+            if os.path.exists(local_file_path):
+                if os.path.getsize(local_file_path) == 0:
+                    print(f"Empty file detected: {sanitized_name}, retrying download.")
+                else:
+                    should_download = False
+
+            if should_download:
+                try:
+                    sftp.get(remote_file_path, local_file_path)
+                    if os.path.exists(local_file_path) and os.path.getsize(local_file_path) > 0:
+                        print(f"Copied and verified: {file_name} -> {sanitized_name} at {local_file_path}")
+                    else:
+                        print(f"Warning: {sanitized_name} not found or empty after copy.")
+                except Exception as e:
+                    print(f"Failed to copy {file_name}: {e}")
+
+# Main function
+def main():
+    parser = argparse.ArgumentParser(description='SFTP File Sync')
+    parser.add_argument('--config', type=str, default='configuration.txt', help='Path to configuration file')
+    parser.add_argument('--interval', type=int, default=30, help='Sync interval in minutes')
+    args = parser.parse_args()
+
+    config = read_config(args.config)
+
+    hostname = config.get('hostname')
+    port = config.get('port', 22)
+    username = config.get('username')
+    password = config.get('password')
+    nafs_path = config.get('nafs_path')
+    remote_dir = '/Dump/stats'
+
+    if not all([hostname, port, username, password, nafs_path]):
+        print("Missing required configuration parameters.")
+        return
+
+    sync_interval = timedelta(minutes=args.interval)
+    last_run_time = datetime.now() - sync_interval
+
+    while True:
+        current_run_time = datetime.now()
+        try:
+            sftp, transport = sftp_connect(hostname, port, username, password)
+            sync_files(sftp, remote_dir, nafs_path, last_run_time, current_run_time)
+            sftp.close()
+            transport.close()
+        except Exception as e:
+            print(f"Connection or sync failed: {e}")
+        last_run_time = current_run_time
+        time.sleep(args.interval * 60)
+
+if __name__ == '__main__':
+    main()
