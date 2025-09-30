@@ -1,0 +1,386 @@
+import sys
+import os
+import traceback
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
+    QFileDialog, QListWidget, QLineEdit, QHBoxLayout, QMessageBox
+)
+from PyQt5.QtCore import Qt
+import pandas as pd
+from io import StringIO
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import logging
+# For Open Button
+from PyQt5.QtGui import (QDesktopServices, QIcon)
+from PyQt5.QtCore import QUrl
+
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# Constants
+COL_WIDTHS = [12, 31, 65, 31, 31, 8, 31, 12, 21, 21, 256, 12, 32, 32, 13, 12, 12]
+COL_NAMES = [
+    "SPID", "User", "IP", "HOST", "Program", "blocked", "DBNAME", "CpuTime",
+    "LogicalReads", "PhysicalReads", "ProcName", "MemUsageKB", "StartTime",
+    "EndTime", "DurationSecs", "KPID", "BatchID"
+]
+CPU_COL_NAMES = ["G1", "timestamp", "G2", "user", "sys", "io", "idle"]
+CPU_WIDTHS = [19, 21, 15, 14, 7, 12, 12]
+CONN_COL_NAMES = ["Channel", "Connections"]
+
+class LogAnalyserApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Core DB Log Analyser")
+        #self.setWindowIcon(QIcon("icon3.ico"))
+        self.setGeometry(100, 100, 600, 400)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        self.file_label = QLabel("Selected Log Files:")
+        layout.addWidget(self.file_label)
+
+        self.file_list = QListWidget()
+        layout.addWidget(self.file_list)
+
+        self.select_files_btn = QPushButton("Select Log Files")
+        self.select_files_btn.clicked.connect(self.select_files)
+        layout.addWidget(self.select_files_btn)
+
+        dir_layout = QHBoxLayout()
+        self.dir_input = QLineEdit()
+        self.dir_input.setPlaceholderText("Select output directory. Default Current Directory")
+        dir_layout.addWidget(self.dir_input)
+
+        self.select_dir_btn = QPushButton("Browse")
+        self.select_dir_btn.clicked.connect(self.select_directory)
+        dir_layout.addWidget(self.select_dir_btn)
+        layout.addLayout(dir_layout)
+
+        self.filename_input = QLineEdit()
+        self.filename_input.setPlaceholderText("Enter output filename (optional). Default output_yyyy_mm_dd_hh_mm")
+        layout.addWidget(self.filename_input)
+
+        self.run_btn = QPushButton("Run Analysis")
+        self.run_btn.clicked.connect(self.run_analysis)
+        layout.addWidget(self.run_btn)
+
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+        #Output Button
+        self.open_file_btn = QPushButton("Open Output File")
+        self.open_file_btn.setEnabled(False)
+        self.open_file_btn.clicked.connect(self.open_output_file)
+        layout.addWidget(self.open_file_btn)
+        #Reset Button
+        self.reset_btn = QPushButton("Reset")
+        self.reset_btn.clicked.connect(self.reset_ui)
+        layout.addWidget(self.reset_btn)
+
+        self.setLayout(layout)
+
+    #Reset Function
+    def reset_ui(self):
+        self.file_list.clear()
+        self.dir_input.clear()
+        self.filename_input.clear()
+        self.status_label.setText("")
+        self.open_file_btn.setEnabled(False)
+        if hasattr(self, 'output_path'):
+            del self.output_path
+
+    def select_files(self):
+        #files, _ = QFileDialog.getOpenFileNames(self, "Select Log Files", os.getcwd(), "Text Files (*.txt);;All Files (*)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Log Files", os.getcwd(), "All Files (*)")
+        if files:
+            self.file_list.clear()
+            self.file_list.addItems(files)
+
+    def select_directory(self):
+        directory = QFileDialog.getExistingDirectory(self, "Select Output Directory", os.getcwd())
+        if directory:
+            self.dir_input.setText(directory)
+
+    def run_analysis(self):
+        try:
+            input_files = [self.file_list.item(i).text() for i in range(self.file_list.count())]
+            if not input_files:
+                raise ValueError("No input files selected.")
+
+            output_dir = self.dir_input.text().strip()
+            if not output_dir:
+                output_dir = os.getcwd()
+
+            filename = self.filename_input.text().strip()
+            if not filename:
+                timestamp = datetime.now().strftime("output_%Y_%d_%m_%H_%M")
+                filename = f"{timestamp}.xlsx"
+            elif not filename.endswith(".xlsx"):
+                filename += ".xlsx"
+
+            output_path = os.path.join(output_dir, filename)
+
+            self.analyse_logs(input_files, output_path)
+
+            self.status_label.setText(f"Analysis completed. Output saved to:\n{output_path}")
+            #Open Button
+            self.open_file_btn.setEnabled(True)
+            self.output_path = output_path  # Store path for later use
+
+        except Exception as e:
+            error_msg = traceback.format_exc()
+            self.status_label.setText("Error occurred during analysis.")
+            QMessageBox.critical(self, "Error", f"An error occurred:\n{str(e)}\n\nDetails:\n{error_msg}")
+
+    def open_output_file(self):
+        if hasattr(self, 'output_path') and os.path.exists(self.output_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_path))
+        else:
+            QMessageBox.warning(self, "File Not Found", "The output file could not be found.")
+
+
+    def analyse_logs(self, input_files, output_file):
+
+        all_dfs = []
+        for input_file in input_files:
+            try:
+                with open(input_file, "r") as f:
+                    lines = f.readlines()
+                start_index = next((i for i, line in enumerate(lines) if "Current Transaction Details" in line), None)
+                if start_index is None:
+                    logging.warning(f"'Current Transaction Details' not found in {input_file}. Skipping.")
+                    continue
+                data_lines = lines[start_index + 3 : start_index + 23]
+                data_str = "".join(data_lines)
+                df = pd.read_fwf(StringIO(data_str), widths=COL_WIDTHS, header=None, names=COL_NAMES)
+                df["SourceFile"] = input_file
+                all_dfs.append(df)
+            except Exception as e:
+                logging.error(f"Error parsing transaction data from {input_file}: {e}")
+        final_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame(columns=COL_NAMES + ["SourceFile"])
+        final_df = final_df[final_df["DurationSecs"].notna() & (final_df["DurationSecs"].astype(str).str.strip() != "")]
+        final_df["ProcName"] = final_df["ProcName"].fillna("").astype(str).str.strip().replace(r'^\s*$', "NO_NAME", regex=True)
+        
+        # --- Parse CPU Stats ---
+        all_cpu_dfs = []
+        for input_file in input_files:
+            try:
+                with open(input_file, "r") as f:
+                    lines = f.readlines()
+                timestamp_index = next((i for i, line in enumerate(lines) if "Phoenix Blocking at" in line), None)
+                kernel_index = next((i for i, line in enumerate(lines) if "Kernel Utilization" in line), None)
+                if timestamp_index is None or kernel_index is None:
+                    logging.warning(f"Missing markers in {input_file}. Skipping.")
+                    continue
+                time_line = lines[timestamp_index].strip()
+                cpu_line = next((line.strip() for line in lines[kernel_index + 1:] if "Average" in line), None)
+                if cpu_line is None:
+                    logging.warning(f"No 'Average' line found in {input_file}. Skipping.")
+                    continue
+                combined_line = time_line + cpu_line
+                df = pd.read_fwf(StringIO(combined_line), widths=CPU_WIDTHS, header=None, names=CPU_COL_NAMES)
+                df[["user", "sys", "io", "idle"]] = df[["user", "sys", "io", "idle"]].replace(r"[ %]", "", regex=True).astype(float)
+                df["CPU_USED"] = 100 - df["idle"]
+                df["timestamp"] = df["timestamp"].replace(r"Phoenix Blocking at\s+", "", regex=True)
+                df["timestamp"] = pd.to_datetime(df["timestamp"], format="%d-%m-%Y %H:%M:%S")
+                df["SourceFile"] = input_file
+                all_cpu_dfs.append(df)
+            except Exception as e:
+                logging.error(f"Error parsing CPU stats from {input_file}: {e}")
+        cpu_df = pd.concat(all_cpu_dfs, ignore_index=True) if all_cpu_dfs else pd.DataFrame(columns=CPU_COL_NAMES + ["CPU_USED", "SourceFile"])
+        cpu_df.drop(columns=["G1", "G2"], axis=1, inplace=True, errors="ignore")
+        
+        # --- Parse Connection Stats ---
+        connections = []
+        for input_file in input_files:
+            try:
+                with open(input_file, "r") as f:
+                    lines = f.readlines()
+                start = next((i for i, line in enumerate(lines) if "TOTAL NUMBER  OF CONNECTIONS FROM EACH Channels" in line), None)
+                end = next((i for i, line in enumerate(lines[start+1:], start+1) if "rows affected" in line), None)
+                if start is None or end is None:
+                    logging.warning(f"Connection markers not found in {input_file}. Skipping.")
+                    connections.append([None])
+                    continue
+                data_lines = lines[start+3:end-1]
+                rows = [line.split() for line in data_lines if line.strip()]
+                df2 = pd.DataFrame(rows, columns=CONN_COL_NAMES)
+                df2["Connections"] = pd.to_numeric(df2["Connections"], errors="coerce").fillna(0).astype(int)
+                connections.append([df2["Connections"].sum()])
+            except Exception as e:
+                logging.error(f"Error parsing connection stats from {input_file}: {e}")
+                connections.append([None])
+        if not cpu_df.empty and connections:
+            cpu_df["Total Connections"] = pd.DataFrame(connections, columns=["Total Connections"])
+        
+        # --- Aggregations ---
+        def aggregate(df, column, suffix):
+            return (
+                df.groupby("ProcName")
+                .agg(
+                    **{
+                        f"MIN_{suffix}": pd.NamedAgg(column=column, aggfunc="min"),
+                        f"AVG_{suffix}": pd.NamedAgg(column=column, aggfunc="mean"),
+                        f"MAX_{suffix}": pd.NamedAgg(column=column, aggfunc="max"),
+                        f"SUM_{suffix}": pd.NamedAgg(column=column, aggfunc="sum"),
+                        "COUNT": pd.NamedAgg(column="ProcName", aggfunc="count")
+                    }
+                )
+                .reset_index()
+                .sort_values(by=f"SUM_{suffix}", ascending=False)
+                .head(10)
+        )
+        
+        proc_by_elapsed = (
+        final_df.groupby("ProcName")
+        .agg(
+            MIN_ELAPSED_TIME=pd.NamedAgg(column='DurationSecs', aggfunc='min'),
+            AVG_ELAPSED_TIME=pd.NamedAgg(column='DurationSecs', aggfunc='mean'),
+            MAX_ELAPSED_TIME=pd.NamedAgg(column='DurationSecs', aggfunc='max'),
+            COUNT=pd.NamedAgg(column='ProcName', aggfunc='count')
+        )
+        .reset_index()
+        .sort_values(by='MAX_ELAPSED_TIME', ascending=False)
+        .head(10)
+        )       
+        
+        proc_by_cpu = aggregate(final_df, "CpuTime", "CPU")
+        proc_by_logical = aggregate(final_df, "LogicalReads", "LOGICAL")
+        proc_by_physical = aggregate(final_df, "PhysicalReads", "PHYSICAL")
+        
+        # --- Plot CPU Usage ---
+        cpu_plot_path = "CPU_Usage.png"
+        if not cpu_df.empty:
+            plt.figure(figsize=(14,7))
+            plt.plot(cpu_df["timestamp"], cpu_df["CPU_USED"], label="Total CPU", linewidth=3.5)
+            plt.plot(cpu_df["timestamp"], cpu_df["user"], label="User CPU")
+            plt.plot(cpu_df["timestamp"], cpu_df["sys"], label="System CPU")
+            plt.plot(cpu_df["timestamp"], cpu_df["io"], label="IO CPU")
+            plt.xlabel("Time")
+            plt.ylabel("CPU Usage %")
+            plt.ylim(0, 100)
+            plt.yticks(range(0,101,10))
+            plt.title("CPU Usage Over Time")
+            positions = np.linspace(0, len(cpu_df["timestamp"])-1, 22, dtype=int)
+            plt.xticks([cpu_df["timestamp"].iloc[i] for i in positions], rotation=90)
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%d-%m %H:%M:%S'))
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(cpu_plot_path)
+            plt.close()
+        
+        # --- Plot Connection Usage ---
+        conn_plot_path = "Connection_Usage.png"
+        if not cpu_df.empty and "Total Connections" in cpu_df.columns:
+            plt.figure(figsize=(14,7))
+            plt.plot(cpu_df["timestamp"], cpu_df["Total Connections"], label="Total Connections", linewidth=3.5)
+            plt.xlabel("Time")
+            plt.ylabel("Connections")
+            plt.title("Connections Usage Over Time")
+            positions = np.linspace(0, len(cpu_df["timestamp"])-1, 22, dtype=int)
+            plt.xticks([cpu_df["timestamp"].iloc[i] for i in positions], rotation=90)
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%d-%m %H:%M:%S'))
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(conn_plot_path)
+            plt.close()
+        
+        # --- Write to Excel ---
+        with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+            final_df.to_excel(writer, sheet_name="AllExecutions", index=False)
+            proc_by_elapsed.to_excel(writer, sheet_name="Proc by Elapsed", index=False)
+            proc_by_cpu.to_excel(writer, sheet_name="Proc by CPU", index=False)
+            proc_by_logical.to_excel(writer, sheet_name="Proc by LogicalReads", index=False)
+            proc_by_physical.to_excel(writer, sheet_name="Proc by PhysicalReads", index=False)
+            cpu_df.to_excel(writer, sheet_name="CPU Stats", index=False)
+        wb = load_workbook(output_file)
+        if os.path.exists(cpu_plot_path):
+            ws = wb.create_sheet("CPU Plot")
+            img = XLImage(cpu_plot_path)
+            ws.add_image(img, "A1")
+        if os.path.exists(conn_plot_path):
+            ws = wb.create_sheet("Connection Plot")
+            img = XLImage(conn_plot_path)
+            ws.add_image(img, "A1")
+        wb.save(output_file)
+        enhance_excel_visuals(output_file)
+        
+        pass  # Placeholder for actual logic
+from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.chart import BarChart, Reference
+from openpyxl import load_workbook
+
+def enhance_excel_visuals(output_file):
+    
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    wb = load_workbook(output_file)
+    for sheet_name in wb.sheetnames:
+        if sheet_name in ["CPU Plot", "Connection Plot"]:
+            continue  # Skip image-only sheets
+
+        ws = wb[sheet_name]
+
+        # Header styling
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color="FFD700", end_color="FFD700", fill_type="solid")
+            cell.border = thin_border
+
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_length = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+                cell.border = thin_border
+            ws.column_dimensions[col_letter].width = max_length + 4
+
+        # Conditional formatting
+        #for col in ws.iter_cols(min_row=2):
+        #    if all(isinstance(cell.value, (int, float)) for cell in col if cell.value is not None):
+        #        col_letter = get_column_letter(col[0].column)
+        #        rule = ColorScaleRule(start_type='min', start_color='F8696B',
+        #                              mid_type='percentile', mid_value=50, mid_color='FFEB84',
+        #                              end_type='max', end_color='63BE7B')
+        #        ws.conditional_formatting.add(f"{col_letter}2:{col_letter}{ws.max_row}", rule)
+
+        # Bar chart for first numeric column
+        #for idx, cell in enumerate(ws[1], start=1):
+        #    if "SUM_" in str(cell.value):
+        #        chart = BarChart()
+        #        chart.title = f"{sheet_name} - Summary Chart"
+        #        data = Reference(ws, min_col=idx, min_row=1, max_row=ws.max_row)
+        #        categories = Reference(ws, min_col=1, min_row=2, max_row=ws.max_row)
+        #        chart.add_data(data, titles_from_data=True)
+        #        chart.set_categories(categories)
+        #        ws.add_chart(chart, f"{get_column_letter(idx+2)}2")
+        #        break
+
+    wb.save(output_file)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = LogAnalyserApp()
+    window.show()
+    sys.exit(app.exec_())
